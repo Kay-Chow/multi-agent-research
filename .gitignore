@@ -1,0 +1,5 @@
+﻿/.env
+/data/
+/outputs/
+__pycache__/
+*.py[cod]
