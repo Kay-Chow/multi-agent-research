@@ -1,223 +1,744 @@
-"""阶段 1 的最小协作图：固定结果模拟 Worker，先验证控制流。"""
+"""产品 Agent 的唯一 LangGraph 工作流；阶段 3 只生成隔离 diff 并等待审核。"""
+
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-import re
-from pathlib import Path
+from app.agents import (
+    IntakeDecisionError, decide_mode, decide_next, generate_code_patch, intake_requirement, product_planner_node,
+    propose_change_plan, researcher_node,
+)
+from app.discovery_tools import run_discovery_tool
+from app.kb_tools import KnowledgeBaseError
+from app.repo_tools import RepoAccessError, inspect_repository, verify_repository
+from app.state import AgentState, SupervisorTarget
+from app.tools import WebSearchError
+from app.workspace_tools import (
+    WorkspaceError, apply_edits, planned_paths, prepare_workspace, verify_workspace,
+)
 
-from app.state import AgentState, Route
-from app.agents import decide_next, researcher_node, coder_node, writer_node
 
-# 限制 Supervisor 的决策次数，防止路由错误导致无限循环。
-MAX_STEPS = 8
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs"
+MAX_REVISIONS = 2
+MAX_CODE_REVISIONS = 2
+MAX_RESEARCH_ROUNDS = 2
+MAX_SUPERVISOR_STEPS = 30
+WORKER_STEPS: tuple[SupervisorTarget, ...] = (
+    "intake", "discovery_tool", "await_user", "await_research_input",
+    "researcher", "product_planner", "review", "save", "finish",
+    "repo_inspector", "change_planner", "save_change_plan",
+    "workspace_prepare", "coder", "diff_review", "finish_code",
+)
 
 
+# 1. 工作流节点：按实际执行顺序集中排列。
 def supervisor_node(state: AgentState) -> dict:
-    """调用模型规划，但由 Python 校验计划、依赖和最终路由。"""
+    """状态机的唯一派工入口。
 
-    if state["step_count"] >= MAX_STEPS:
+    `next_step` 由上一个节点显式写入。Intake 已确定任务模式，Supervisor
+    不再重新解读用户需求；它只在研究后、方案后决定是否补查。
+    接待阶段可跨多轮，因此不占正式任务的派工预算。
+    """
+
+    step = state["next_step"]
+    if step in {"intake", "discovery_tool", "await_user"}:
+        return {"events": [f"supervisor -> {step}：接待阶段"]}
+
+    steps = state.get("supervisor_steps", 0) + 1
+    if steps > MAX_SUPERVISOR_STEPS:
         return {
-            "next_agent": "finish",
-            "events": ["supervisor -> finish（达到步数上限）"],
+            "workflow_status": "blocked", "error": "Supervisor 派工次数达到上限",
+            "next_step": None,
+            "events": ["supervisor：达到派工上限，停止任务"],
         }
 
-    decision = decide_next(state)
+    mode = state["mode"]
+    if mode not in ("proposal_only", "code_change"):
+        raise ValueError("任务模式尚未由 Intake 确定")
 
-    # 先判断，首轮的时候不应该有计划，计划要在首轮的时候由大模型来制定
-    if state["step_count"] > 0 and not state["plan"]:
-        raise ValueError("状态不一致：已经执行过 Supervisor，但没有计划")
-
-    needs_planning = not state["plan"]
-
-    needs_code = decision.needs_code if needs_planning else state["needs_code"]
-    expected_plan = (
-        ["researcher", "coder", "writer"]
-        if needs_code
-        else ["researcher", "writer"]
-    )
-
-    if needs_planning:
-        if decision.plan != expected_plan:
-            raise ValueError(f"Supervisor 给出无效计划：{decision.plan}")
-        plan = decision.plan
-    else:
-        plan = state["plan"]
-        if decision.plan != plan or decision.needs_code != needs_code:
-            raise ValueError("Supervisor 在执行过程中擅自改变了计划")
-
-    # 按计划寻找第一项尚未完成的工作；plan 在这里真正参与路由。
-    completed = {
-        "researcher": state["research"] is not None,
-        "coder": state["code"] is not None,
-        "writer": state["draft_report"] is not None,
+    allowed = _allowed_supervisor_targets(state)
+    chosen = decide_next(state, allowed)
+    if chosen.next_agent not in allowed:
+        raise ValueError(f"Supervisor 选择了当前不允许的节点：{chosen.next_agent}")
+    update = {
+        "supervisor_steps": steps,
+        "next_step": chosen.next_agent,
+        "events": [f"supervisor -> {chosen.next_agent}：{chosen.reason}"],
     }
-    expected_next = next(
-        (agent for agent in plan if not completed[agent]),
-        "finish",
-    )
+    if chosen.next_agent == "researcher":
+        update["research_rounds"] = state.get("research_rounds", 0) + 1
+        if state["review_status"] == "pending":
+            # 已有方案尚未交人审核时，先作废待审核标记；保留草稿供重写参考。
+            update["review_status"] = "not_ready"
+    return update
 
-    # 模型可以提议下一步，但不能跳过前置步骤或重复执行已完成步骤。
-    if decision.next_agent != expected_next:
-        raise ValueError(
-            f"Supervisor 路由错误：提议 {decision.next_agent}，"
-            f"当前应为 {expected_next}"
-        )
 
+def intake_node(state: AgentState) -> dict:
+    """理解一轮输入，返回接待状态；下一位 Worker 由 Supervisor 统一派发。
+
+    对话入口把历史消息和已有观察交给模型。它可以请求只读工具、
+    向用户澄清或提炼正式需求，但不直接连到工具、用户中断或 Researcher。
+    显式创建任务已经给出完整 request；本节点只确认模式，不调用澄清模型。
+    """
+
+    if state["intake_status"] == "ready" and not state["conversation"]:
+        return _finish_intake(state, state["request"], None)
+    if state["intake_status"] != "collecting" or not state["conversation"]:
+        raise ValueError("需求澄清状态或对话历史无效")
+
+    try:
+        decision = intake_requirement(state)
+    except IntakeDecisionError:
+        # 连续两次无效输出是模型问题，不把它当成用户已确认的需求；
+        # 保留当前对话和已查到的证据，等待用户下一句话重新尝试。
+        reply = "抱歉，我刚才没能完成这一步判断，尚未开始正式任务。你可以回复‘重试’，或补充当前需求；已查到的资料会保留。"
+        return {
+            "conversation": state["conversation"] + [{"role": "assistant", "text": reply}],
+            "intake_status": "clarify", "intake_reply": reply,
+            "next_step": "await_user",
+            "events": ["intake：模型决定校验失败，等待用户重述"],
+        }
+    if decision.tool_name:
+        if state.get("discovery_lookup_count", 0) >= 4:
+            reply = "这轮已查阅多项资料。请提供更具体的问题或仓库路径，我再继续。"
+            return {
+                "conversation": state["conversation"] + [{"role": "assistant", "text": reply}],
+                "intake_status": "clarify", "intake_reply": reply,
+                "next_step": "await_user",
+                "events": ["intake：本轮只读查找达到上限，等待用户补充"],
+            }
+        return {
+            "intake_status": "lookup",
+            "next_step": "discovery_tool",
+            "discovery_tool": decision.tool_name,
+            "discovery_query": decision.tool_query,
+            "discovery_path": decision.tool_path,
+            "events": [f"intake：请求只读工具 {decision.tool_name}"],
+        }
+    # ready=True 时 request 才是必需产物；如果模型省略提示语，就由程序补一句。
+    reply = decision.reply.strip() or "需求已明确，我先调研并整理产品方案。"
+    if decision.ready:
+        return _finish_intake(state, decision.request.strip(), reply)
     return {
-        "plan": plan,
-        "needs_code": needs_code,
-        "next_agent": decision.next_agent,
-        "instruction": decision.instruction,
-        "step_count": state["step_count"] + 1,
-        "events": [
-            f"supervisor -> {decision.next_agent}：{decision.reason}"
-        ],
+        "conversation": state["conversation"] + [{"role": "assistant", "text": reply}],
+        "intake_status": "clarify",
+        "next_step": "await_user",
+        "intake_reply": reply,
+        "events": ["intake：信息不足，等待用户补充"],
     }
 
 
-def route_after_supervisor(state: AgentState) -> Route:
-    """条件边读取 Supervisor 写入的 next_agent，选择下一节点。"""
+def discovery_tool_node(state: AgentState) -> dict:
+    """执行一个受限只读工具，合并来源后回 Supervisor，再由它派发 Intake。"""
 
-    return state["next_agent"]
+    name = state.get("discovery_tool")
+    if state.get("intake_status") != "lookup" or not name:
+        raise ValueError("当前没有待执行的接待工具")
+    try:
+        result = run_discovery_tool(
+            name, query=state.get("discovery_query"), path=state.get("discovery_path"),
+            repo_root=state.get("repo_root"),
+        )
+        observation = result.observation[:5000]
+        repo_root = result.repo_root or state.get("repo_root")
+        sources = list(state.get("sources", []))
+        seen = {source["locator"] for source in sources}
+        for item in result.sources:
+            if item["locator"] in seen or not item["snippet"].strip():
+                continue
+            # 对话可以持续多轮，但 checkpoint 里只保留有限的证据数量。
+            if len(sources) >= 12:
+                break
+            sources.append({"source_id": len(sources) + 1, **item})
+            seen.add(item["locator"])
+    except (RepoAccessError, KnowledgeBaseError, WebSearchError, ValueError) as exc:
+        # 可选的探索查询失败不立即销毁整条会话；模型可以解释或请用户给路径。
+        observation = f"工具 {name} 失败：{exc}"
+        repo_root = state.get("repo_root")
+        sources = list(state.get("sources", []))
+    return {
+        "intake_status": "collecting",
+        "next_step": "intake",
+        "discovery_tool": None, "discovery_query": None, "discovery_path": None,
+        "discovery_lookup_count": state.get("discovery_lookup_count", 0) + 1,
+        "discovery_observations": (state.get("discovery_observations", []) + [f"{name}: {observation}"])[-8:],
+        "repo_root": repo_root,
+        "sources": sources,
+        "events": [f"discovery_tool：{name} 已返回只读观察"],
+    }
 
 
-MAX_REVISIONS = 2
+def await_user_node(state: AgentState) -> dict:
+    """用 LangGraph interrupt 暂停会话，并把下一句用户输入存进 State。
+
+    恢复时这个节点会从头重跑，因此 interrupt 之前只做无副作用校验；
+    CLI 用同一 thread_id 和 Command(resume=...) 送回下一句话。
+    """
+
+    if state["intake_status"] != "clarify" or not state["intake_reply"]:
+        raise ValueError("当前没有待用户回答的澄清问题")
+    response = interrupt({
+        "kind": "intake",
+        "session_id": state["task_id"],
+        "question": state["intake_reply"],
+    })
+    if not isinstance(response, dict) or not isinstance(response.get("message"), str):
+        raise ValueError("澄清回复必须包含文本 message")
+    message = response["message"].strip()
+    if not message or len(message) > 1000:
+        raise ValueError("单条聊天消息长度必须在 1～1000 字符之间")
+    return {
+        "conversation": state["conversation"] + [{"role": "user", "text": message}],
+        "intake_status": "collecting",
+        "next_step": "intake",
+        "intake_reply": None,
+        "discovery_lookup_count": 0,
+        "events": ["await_user：收到用户补充，交回 Supervisor 继续派工"],
+    }
 
 
+def await_research_input_node(state: AgentState) -> dict:
+    """调研缺关键依据时暂停，收到用户说明后保留为可引用的用户来源。
+
+    Researcher 先把问题写进 State；本节点只负责 interrupt 和接收回复。
+    恢复后仍回 Supervisor，再由它派 Researcher 重新整理证据，而不是
+    把用户回答直接当成已完成的调研报告。
+    """
+
+    question = state.get("research_question")
+    if not question:
+        raise ValueError("当前没有待用户补充的调研问题")
+    response = interrupt({
+        "kind": "research",
+        "session_id": state["task_id"],
+        "question": question,
+    })
+    if not isinstance(response, dict) or not isinstance(response.get("message"), str):
+        raise ValueError("调研补充必须包含文本 message")
+    message = response["message"].strip()
+    if not message or len(message) > 1000:
+        raise ValueError("单条补充消息长度必须在 1～1000 字符之间")
+    source_id = max((source["source_id"] for source in state["sources"]), default=0) + 1
+    user_source = {
+        "source_id": source_id,
+        "source_type": "user",
+        "title": "用户补充",
+        "locator": f"conversation/{state['task_id']}#research-answer",
+        "snippet": message,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    return {
+        "conversation": state["conversation"] + [{"role": "user", "text": message}],
+        "sources": state["sources"] + [user_source],
+        "research_question": None,
+        "research_clarified": True,
+        "next_step": "researcher",
+        "events": ["await_research_input：收到用户补充，交回 Supervisor 继续调研"],
+    }
+
+
+# 调研和产品方案节点定义在 agents.py；下面是第一道人审与方案落盘。
 def review_node(state: AgentState) -> dict:
-    """暂停等待人工决定；暂停前不能保存文件等产生副作用。"""
+    """只暂停和接收决定；写文件等副作用必须放到后续节点。"""
 
-    if state["review_status"] != "pending" or state["draft_report"] is None:
-        raise ValueError("没有可审核的报告草稿")
+    if state["review_status"] != "pending" or state["draft_plan"] is None:
+        raise ValueError("当前没有可审核的产品方案")
 
     decision = interrupt({
         "task_id": state["task_id"],
-        "draft_report": state["draft_report"],
+        "mode": state["mode"],
+        "research_report": state["research_report"],
+        "draft_plan": state["draft_plan"],
         "revision_count": state["revision_count"],
         "options": ["approve", "reject", "terminate"],
     })
-
     if not isinstance(decision, dict):
         raise ValueError("审核结果必须是字典")
 
     action = decision.get("action")
-
     if action == "approve":
         return {
             "review_status": "approved",
-            "final_report": state["draft_report"],
-            "events": ["review：人工批准报告"],
+            "final_plan": state["draft_plan"],
+            "next_step": "save",
+            "events": ["review：人工批准产品方案"],
         }
-
     if action == "reject":
         if state["revision_count"] >= MAX_REVISIONS:
             return {
                 "review_status": "terminated",
-                "events": ["review：修改次数已达上限，终止任务"],
+                "workflow_status": "terminated",
+                "next_step": None,
+                "events": ["review：退回次数达到上限，任务终止"],
             }
-
         feedback = str(decision.get("feedback") or "").strip()
         if not feedback:
-            raise ValueError("拒绝报告时必须给出修改意见")
-
+            raise ValueError("退回方案时必须填写修改意见")
         return {
             "review_status": "rejected",
             "review_feedback": feedback,
             "revision_count": state["revision_count"] + 1,
-            "events": ["review：人工退回，交给 Writer 修改"],
+            "next_step": "product_planner",
+            "events": ["review：人工退回产品方案"],
         }
-
     if action == "terminate":
         return {
             "review_status": "terminated",
+            "workflow_status": "terminated",
+            "next_step": None,
             "events": ["review：人工终止任务"],
         }
-
     raise ValueError(f"未知审核操作：{action}")
 
 
-def route_after_review(state: AgentState) -> str:
-    """拒绝后返回 Writer；批准或终止则结束图。"""
-    return state["review_status"]
+def save_node(state: AgentState) -> dict:
+    """方案批准后保存两份独立 Markdown；重复恢复不会产生第二份。"""
 
-
-def save_report_node(state: AgentState) -> dict:
-    """只有人工批准后才保存；重复执行时不覆盖不同内容的旧报告。"""
-
-    report = state["final_report"]
-    if state["review_status"] != "approved" or not isinstance(report, str) or not report.strip():
-        raise ValueError("报告未经批准，不能保存")
+    if state["review_status"] != "approved":
+        raise ValueError("方案未经人工批准，不能保存")
+    research = state["research_report"]
+    proposal = state["final_plan"]
+    if not research or not proposal:
+        raise ValueError("调研报告或最终方案为空")
 
     task_id = state["task_id"]
-    if not re.fullmatch(r"[0-9a-f]{32}", task_id):
-        raise ValueError("任务 ID 格式不正确")
-
-    output_dir = OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    output_file = output_dir / f"{task_id}.md"
-    content = report.rstrip() + "\n"
-
-    if output_file.exists():
-        # checkpoint 恢复或节点重试时，已有相同内容就视为保存成功。
-        if output_file.read_text(encoding="utf-8") != content:
-            raise FileExistsError(f"同名报告已存在且内容不同：{output_file}")
-    else:
-        # 先写临时文件，再替换为最终文件，避免留下写了一半的报告。
-        temp_file = output_dir / f".{task_id}.tmp"
-        temp_file.write_text(content, encoding="utf-8")
-        temp_file.replace(output_file)
-
-    relative_path = f"outputs/{task_id}.md"
+    directory = _task_output_dir(task_id)
+    _write_once(directory / "research.md", research)
+    _write_once(directory / "proposal.md", proposal)
     return {
-        "output_path": relative_path,
-        "events": [f"save：报告已保存至 {relative_path}"],
+        "research_path": f"outputs/{task_id}/research.md",
+        "proposal_path": f"outputs/{task_id}/proposal.md",
+        "next_step": "finish" if state["mode"] == "proposal_only" else "repo_inspector",
+        "events": ["save：已保存调研报告与产品方案"],
     }
 
 
+def finish_node(state: AgentState) -> dict:
+    """只出方案任务在人工批准并保存后完成。"""
+
+    if state["mode"] != "proposal_only":
+        raise ValueError("代码任务不能在方案保存后提前结束")
+    if state["review_status"] != "approved" or not state["research_path"] or not state["proposal_path"]:
+        raise ValueError("产品方案尚未批准或保存，不能结束任务")
+    return {
+        "workflow_status": "completed",
+        "next_step": None,
+        "events": ["finish：仅调研/方案任务完成"],
+    }
+
+
+# 代码阶段：仓库检查、隔离候选和第二道人审。
+def repo_inspector_node(state: AgentState) -> dict:
+    """只读检查会话中选定的仓库；代码阶段仍只取小范围文件元数据。"""
+
+    try:
+        if state["review_status"] != "approved":
+            raise RepoAccessError("产品方案尚未批准，不能进入仓库阶段")
+        if not state.get("repo_root"):
+            raise RepoAccessError("尚未选定仓库；请在需求中给出路径并重新开始任务")
+        context, _ = inspect_repository(state["repo_root"])
+    except RepoAccessError as exc:
+        return {
+            "workflow_status": "blocked",
+            "error": str(exc),
+            "next_step": None,
+            "events": [f"repo_inspector：停止，{exc}"],
+        }
+    return {
+        "repo_context": context,
+        "next_step": "change_planner",
+        "events": [f"repo_inspector：只读检查 {len(context['files'])} 个文件，HEAD={context['head'][:8]}"],
+    }
+
+
+def change_planner_node(state: AgentState) -> dict:
+    """仓库未变化才让模型写文件级计划；任何校验失败都不改仓库。"""
+
+    context = state["repo_context"]
+    if context is None:
+        raise ValueError("缺少仓库只读检查结果")
+    try:
+        contents = verify_repository(context)
+        plan = propose_change_plan(state, contents)
+    except (RepoAccessError, ValueError) as exc:
+        return {
+            "workflow_status": "blocked",
+            "error": str(exc),
+            "next_step": None,
+            "events": [f"change_planner：停止，{exc}"],
+        }
+    return {
+        "change_plan": plan,
+        "next_step": "save_change_plan",
+        "events": ["change_planner：形成文件级改动和测试计划；尚未修改代码"],
+    }
+
+
+def save_change_plan_node(state: AgentState) -> dict:
+    """将文件级计划写入 Agent 输出目录；不修改已选原仓库。"""
+
+    plan = state["change_plan"]
+    if state["review_status"] != "approved" or not plan:
+        raise ValueError("没有可保存的文件级变更计划")
+    task_id = state["task_id"]
+    directory = _task_output_dir(task_id)
+    _write_once(directory / "change_plan.md", plan)
+    return {
+        "change_plan_path": f"outputs/{task_id}/change_plan.md",
+        "next_step": "workspace_prepare",
+        "events": ["save：已保存文件级变更计划"],
+    }
+
+
+def workspace_prepare_node(state: AgentState) -> dict:
+    """建立一次代码尝试对应的隔离工作区。
+
+    首次生成和人工退回后重新生成都经过此节点；每次先验证原仓库
+    与先前读取的基线一致，再从该基线复制固定白名单文件。单独成节点
+    是为了在 checkpoint 中明确记录准备完成；Coder 重跑时会再次复位
+    工作区，避免沿用一次中断后留下的不完整候选文件。
+    """
+
+    context = state["repo_context"]
+    plan = state["change_plan"]
+    if state["review_status"] != "approved" or context is None or not plan or not state["change_plan_path"]:
+        raise ValueError("方案未批准，或缺少仓库快照、文件级计划及其保存路径")
+    attempt = state.get("code_revision_count", 0)
+    try:
+        # 即使此节点尚不写候选代码，也先确认计划确实包含合法的目标文件。
+        planned_paths(plan)
+        workspace, _ = prepare_workspace(context, state["task_id"], attempt)
+    except (RepoAccessError, WorkspaceError) as exc:
+        return {
+            "workflow_status": "blocked", "error": str(exc), "next_step": None,
+            "events": [f"workspace_prepare：停止，{exc}"],
+        }
+    return {
+        "workspace_path": workspace,
+        "code_review_status": "not_ready",
+        "next_step": "coder",
+        "events": [f"workspace_prepare：建立第 {attempt + 1} 次隔离工作区；基线仓库未改动"],
+    }
+
+
+def coder_node(state: AgentState) -> dict:
+    """生成候选文件、保存 diff，然后将任务交给第二个人工门禁。
+
+    模型没有文件操作权限，只返回结构化的完整文件内容；程序负责验证
+    路径、语法、大小和哈希。所有写入只发生在任务专属工作区与 diff
+    输出目录，绝不直接覆盖已选原仓库，也不执行测试或 Git 提交。
+    """
+
+    context = state["repo_context"]
+    plan = state["change_plan"]
+    if state["review_status"] != "approved" or context is None or not plan or not state["workspace_path"]:
+        raise ValueError("方案未批准，或缺少仓库快照、文件级计划及隔离工作区")
+    attempt = state.get("code_revision_count", 0)
+    try:
+        paths = planned_paths(plan)
+        # 中断或超时后可以再次运行该节点：先复位，再让模型重新生成。
+        # 因此不会把上一次不完整的文件当成新一轮修改的输入。
+        workspace, baseline = prepare_workspace(context, state["task_id"], attempt)
+        draft = generate_code_patch(state, baseline, paths)
+        actual_workspace, diff, hashes = apply_edits(
+            context, state["task_id"], attempt,
+            [edit.model_dump() for edit in draft.edits], paths,
+        )
+        if workspace != actual_workspace:
+            raise WorkspaceError("隔离工作区路径不一致")
+        diff_path = _write_diff(state["task_id"], attempt, diff)
+    except (RepoAccessError, WorkspaceError, ValueError) as exc:
+        return {
+            "workflow_status": "blocked", "error": str(exc), "next_step": None,
+            "events": [f"coder：停止，{exc}"],
+        }
+    return {
+        "workspace_path": workspace,
+        "diff_path": diff_path,
+        "diff": diff,
+        "file_hashes": hashes,
+        "code_summary": draft.summary.strip(),
+        "code_review_status": "pending",
+        "workflow_status": "diff_pending",
+        "next_step": "diff_review",
+        "error": None,
+        "events": [f"coder：生成 {len(hashes)} 个候选文件和 diff；未运行测试、未提交"],
+    }
+
+
+def diff_review_node(state: AgentState) -> dict:
+    """暂停等待人工审核隔离区 diff，而非直接执行候选代码。
+
+    批准时重新核对 diff 文件、原仓库和隔离区哈希，防止等待期间被调包；
+    退回时记录反馈并进入下一次独立尝试；终止时不碰原仓库。
+    """
+
+    if state.get("code_review_status") != "pending" or not state.get("diff"):
+        raise ValueError("当前没有可审核的代码 diff")
+    decision = interrupt({
+        "task_id": state["task_id"],
+        "diff": state["diff"],
+        "diff_path": state["diff_path"],
+        "workspace_path": state["workspace_path"],
+        "file_hashes": state["file_hashes"],
+        "code_revision_count": state["code_revision_count"],
+        "options": ["approve", "reject", "terminate"],
+    })
+    if not isinstance(decision, dict):
+        raise ValueError("代码审核结果必须是字典")
+    action = decision.get("action")
+    if action == "approve":
+        try:
+            _verify_diff_candidate(state)
+        except (RepoAccessError, WorkspaceError) as exc:
+            return {
+                "workflow_status": "blocked", "error": str(exc), "next_step": None,
+                "events": [f"diff_review：审核时文件变化，停止；{exc}"],
+            }
+        return {
+            "code_review_status": "approved",
+            "next_step": "finish_code",
+            "events": ["diff_review：人工批准 diff；尚未运行测试或提交"],
+        }
+    if action == "reject":
+        # 退回不在现有候选文件上继续修改；新 attempt 从同一基线重新生成。
+        if state["code_revision_count"] >= MAX_CODE_REVISIONS:
+            return {
+                "code_review_status": "terminated", "workflow_status": "terminated",
+                "next_step": None,
+                "events": ["diff_review：退回次数达到上限，任务终止"],
+            }
+        feedback = str(decision.get("feedback") or "").strip()
+        if not feedback:
+            raise ValueError("退回 diff 时必须填写修改意见")
+        return {
+            "code_review_status": "rejected",
+            "code_review_feedback": feedback,
+            "code_revision_count": state["code_revision_count"] + 1,
+            "next_step": "workspace_prepare",
+            "events": ["diff_review：人工退回 diff，进入新隔离工作区重做"],
+        }
+    if action == "terminate":
+        return {
+            "code_review_status": "terminated", "workflow_status": "terminated",
+            "next_step": None,
+            "events": ["diff_review：人工终止代码任务；无 Git 提交"],
+        }
+    raise ValueError(f"未知代码审核操作：{action}")
+
+
+def finish_code_node(state: AgentState) -> dict:
+    """阶段 3 的完成线只是 diff 获批，不伪称已测试或提交。"""
+
+    if state["code_review_status"] != "approved":
+        raise ValueError("代码 diff 未经人工批准")
+    return {
+        "workflow_status": "diff_approved",
+        "next_step": None,
+        "events": ["finish_code：diff 已批准；当前未执行测试、提交或发布"],
+    }
+
+
+# 2. 辅助函数：供上述节点和图装配调用，本身不是 LangGraph 节点。
+def _allowed_supervisor_targets(state: AgentState) -> list[SupervisorTarget]:
+    """把显式下一步转成合法候选；仅两个补查点允许模型二选一。"""
+
+    if state["review_status"] == "terminated" or state["code_review_status"] == "terminated":
+        raise ValueError("任务已终止，不允许继续派工")
+    step = state["next_step"]
+    if step == "assess_research":
+        allowed: list[SupervisorTarget] = ["product_planner"]
+    elif step == "assess_plan":
+        allowed = ["review"]
+    elif step in WORKER_STEPS:
+        return [cast(SupervisorTarget, step)]
+    else:
+        raise ValueError(f"未知或已结束的下一步：{step}")
+    if state["research_rounds"] < MAX_RESEARCH_ROUNDS:
+        allowed.append("researcher")
+    return allowed
+
+
+def route_after_supervisor(state: AgentState) -> str:
+    """Supervisor 已把决策写成具体 Worker；阻断则直接结束。"""
+
+    if state["workflow_status"] == "blocked":
+        return "blocked"
+    target = state["next_step"]
+    if target not in WORKER_STEPS:
+        raise ValueError(f"Supervisor 未设置有效的下一位执行者：{target}")
+    return target
+
+
+def route_after_worker(state: AgentState) -> str:
+    """所有非完成节点共用这一条回边；终止或阻断时直接结束。"""
+
+    return "stop" if state["workflow_status"] in {"blocked", "terminated"} else "continue"
+
+
+def _finish_intake(state: AgentState, request: str, reply: str | None) -> dict:
+    """需求明确后确定模式；显式任务和聊天任务共用这一个出口。
+
+    聊天模式仅依据用户原话分类，避免仓库资料影响模型整理出的 request；
+    显式任务则优先使用调用方指定的模式，没有指定才依据 request 判断。
+    代码任务若尚无仓库，先澄清或阻断，不进入调研。
+    """
+
+    user_words = "\n".join(
+        item["text"] for item in state["conversation"][-12:] if item["role"] == "user"
+    )
+    if state["requested_mode"] is not None:
+        mode, reason = state["requested_mode"], "调用方指定模式"
+    else:
+        decision = decide_mode(user_words or request)
+        mode, reason = decision.mode, decision.reason
+    if mode not in ("proposal_only", "code_change"):
+        raise ValueError(f"未知任务模式：{mode}")
+
+    if mode == "code_change" and not state.get("repo_root"):
+        if not state["conversation"]:
+            return {
+                "mode": mode, "next_step": None,
+                "workflow_status": "blocked",
+                "error": "代码任务缺少 repo_root；HTTP 创建任务需显式提供仓库路径",
+                "events": ["intake：缺少仓库路径，任务停止"],
+            }
+        question = "要生成候选代码，请先告诉我仓库路径；也可以让我在已授权的项目目录中查找。"
+        return {
+            "request": request,
+            "conversation": state["conversation"] + [{"role": "assistant", "text": question}],
+            "intake_status": "clarify", "intake_reply": question,
+            "next_step": "await_user",
+            "events": ["intake：等待选定代码仓库"],
+        }
+
+    plan = ["researcher", "product_planner", "human_review"]
+    if mode == "code_change":
+        plan += ["repo_inspector", "change_planner", "workspace_prepare", "coder", "diff_review"]
+    conversation = state["conversation"]
+    if reply is not None:
+        conversation = conversation + [{"role": "assistant", "text": reply}]
+    return {
+        "request": request,
+        "conversation": conversation,
+        "mode": mode,
+        "plan": plan,
+        "intake_status": "ready",
+        "intake_reply": reply,
+        "next_step": "researcher",
+        "events": [f"intake：需求已明确，模式 {mode}；{reason}"],
+    }
+
+
+def _task_output_dir(task_id: str) -> Path:
+    """所有任务产物只写到固定的 outputs/<任务ID>，不跟随链接目录。"""
+
+    if not re.fullmatch(r"[0-9a-f]{32}", task_id):
+        raise ValueError("任务 ID 格式不正确")
+    directory = OUTPUT_DIR / task_id
+    if any(path.is_symlink() or path.is_junction() for path in (OUTPUT_DIR, directory)):
+        raise WorkspaceError("任务输出目录不能是链接或 junction")
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _write_once(path: Path, content: str) -> None:
+    """重试时同内容视为成功，不覆盖已有的不同批准版本。"""
+
+    content = content.rstrip() + "\n"
+    temp = path.with_suffix(path.suffix + ".tmp")
+    if any(item.is_symlink() or item.is_junction() for item in (path, temp)):
+        raise WorkspaceError("任务输出文件不能是链接或 junction")
+    if path.exists():
+        if path.read_text(encoding="utf-8") != content:
+            raise FileExistsError(f"已存在不同内容的批准文件：{path}")
+        return
+    temp.write_text(content, encoding="utf-8")
+    temp.replace(path)
+
+
+def _write_diff(task_id: str, attempt: int, diff: str) -> str:
+    """只把候选 diff 写到 Agent 项目的输出目录，拒绝链接路径。"""
+
+    directory = _task_output_dir(task_id)
+    # 每次退回使用新 attempt；保留旧补丁，便于人工对照修改前后。
+    target = directory / f"diff-attempt-{attempt}.patch"
+    temp = target.with_suffix(".patch.tmp")
+    if any(path.is_symlink() or path.is_junction() for path in (target, temp)):
+        raise WorkspaceError("diff 输出文件不能是链接或 junction")
+    temp.write_text(diff, encoding="utf-8")
+    temp.replace(target)
+    return f"outputs/{task_id}/{target.name}"
+
+
+def _verify_diff_candidate(state: AgentState) -> None:
+    """批准前重查补丁、原仓库和候选工作区，防止审核期间内容被替换。"""
+
+    context = state["repo_context"]
+    if context is None:
+        raise WorkspaceError("缺少仓库基线，不能批准 diff")
+    diff_file = OUTPUT_DIR / state["task_id"] / f"diff-attempt-{state['code_revision_count']}.patch"
+    if (
+        OUTPUT_DIR.is_symlink() or OUTPUT_DIR.is_junction()
+        or diff_file.parent.is_symlink() or diff_file.parent.is_junction()
+        or not diff_file.is_file() or diff_file.is_symlink() or diff_file.is_junction()
+        or diff_file.read_text(encoding="utf-8") != state["diff"]
+    ):
+        raise WorkspaceError("待审核 diff 文件在审核期间变化")
+    verify_workspace(
+        context, state["task_id"], state["code_revision_count"], state["file_hashes"],
+    )
+
+
+# 3. 图装配：注册节点并连接所有派工与停止边。
 def build_graph(checkpointer):
-    """组装并编译状态图；本阶段不配置 checkpoint 持久化。"""
+    """组装唯一的产品交付工作流，并绑定可恢复的 checkpointer。
+
+    START 先到 Supervisor，再由它派发 Intake；接待、只读工具和等待用户
+    完成后都返回 Supervisor。正式任务的每个专职节点也回到 Supervisor
+    重新派工；资料缺口会暂停向用户求证，再继续调研。Supervisor 只能在程序允许的节点中
+    选择下一位执行者；两道审核仍由 `interrupt` 暂停，不能由模型批准。
+    """
 
     builder = StateGraph(AgentState)
-
+    # 注册顺序按上方职责分区排列；真正的执行顺序由下方边决定。
     builder.add_node("supervisor", supervisor_node)
+    builder.add_node("intake", intake_node)
+    builder.add_node("discovery_tool", discovery_tool_node)
+    builder.add_node("await_user", await_user_node)
+    builder.add_node("await_research_input", await_research_input_node)
     builder.add_node("researcher", researcher_node)
-    builder.add_node("coder", coder_node)
-    builder.add_node("writer", writer_node)
+    builder.add_node("product_planner", product_planner_node)
     builder.add_node("review", review_node)
-    builder.add_node("save", save_report_node)
+    builder.add_node("save", save_node)
+    builder.add_node("finish", finish_node)
+    builder.add_node("repo_inspector", repo_inspector_node)
+    builder.add_node("change_planner", change_planner_node)
+    builder.add_node("save_change_plan", save_change_plan_node)
+    builder.add_node("workspace_prepare", workspace_prepare_node)
+    builder.add_node("coder", coder_node)
+    builder.add_node("diff_review", diff_review_node)
+    builder.add_node("finish_code", finish_code_node)
 
-    # 入口固定到 Supervisor；其出口只使用条件边，避免意外并行执行。
+    # 入口和唯一派工点。具体目标直接取 next_step，不再手写第二份节点名单。
     builder.add_edge(START, "supervisor")
     builder.add_conditional_edges(
-        "supervisor",
-        route_after_supervisor,
-        {
-            "researcher": "researcher",
-            "coder": "coder",
-            "writer": "writer",
-            "finish": END,
-        },
+        "supervisor", route_after_supervisor,
+        {**{worker: worker for worker in WORKER_STEPS}, "blocked": END},
     )
-
-    # Worker 完成后都回到 Supervisor，由它决定继续还是结束。
-    for worker in ("researcher", "coder"):
-        builder.add_edge(worker, "supervisor")
-
-    # Writer 完成后进入人工审核；退回修改不再经过 Supervisor。
-    builder.add_edge("writer", "review")
-    builder.add_conditional_edges(
-        "review",
-        route_after_review,
-        {
-            "rejected": "writer",
-            "approved": "save",
-            "terminated": END,
-        },
-    )
-    builder.add_edge("save", END)
-
+    # 所有非完成 Worker 都只写 next_step，然后回 Supervisor；阻断/终止直接结束。
+    # 因此图的回边只有一条规则，具体业务转移写在产生结果的节点旁边。
+    for worker in WORKER_STEPS:
+        if worker in {"finish", "finish_code"}:
+            continue
+        builder.add_conditional_edges(
+            worker, route_after_worker,
+            {"continue": "supervisor", "stop": END},
+        )
+    builder.add_edge("finish_code", END)
+    builder.add_edge("finish", END)
     return builder.compile(checkpointer=checkpointer)
-
