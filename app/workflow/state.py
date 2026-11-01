@@ -1,4 +1,4 @@
-"""产品调研与研发交付 Agent 的共享状态。"""
+"""产品调研与研发交付工作流的共享状态。"""
 
 from operator import add
 from typing import Annotated, Literal, TypedDict

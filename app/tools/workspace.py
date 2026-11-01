@@ -6,11 +6,11 @@ import hashlib
 import re
 from pathlib import Path
 
-from app.repo_tools import READ_ALLOWLIST, RepoAccessError, validate_change_path, verify_repository
-from app.state import FileHash, RepoContext
+from app.config import PROJECT_ROOT
+from app.tools.repository import READ_ALLOWLIST, RepoAccessError, validate_change_path, verify_repository
+from app.workflow.state import FileHash, RepoContext
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PROJECT_ROOT / "data" / "workspaces"
 MAX_EDIT_FILES = 3
 MAX_FILE_BYTES = 16_000

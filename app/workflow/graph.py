@@ -1,28 +1,29 @@
 """产品 Agent 的唯一 LangGraph 工作流；阶段 3 只生成隔离 diff 并等待审核。"""
 
-import re
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from app.agents import (
-    IntakeDecisionError, decide_mode, decide_next, generate_code_patch, intake_requirement, product_planner_node,
-    propose_change_plan, researcher_node,
+from app.agents.intake import IntakeDecisionError, decide_mode, intake_requirement
+from app.agents.planner import build_product_plan, propose_change_plan
+from app.agents.researcher import ResearchNeedsInput, conduct_research
+from app.agents.supervisor import decide_next
+from app.config import PROJECT_ROOT
+from app.services.artifact_store import save_change_plan, save_reports, verify_diff_candidate
+from app.services.candidate_delivery import generate_candidate
+from app.services.evidence import merge_discovery_sources, user_research_source
+from app.tools.discovery import run_discovery_tool
+from app.tools.knowledge_base import KnowledgeBaseError
+from app.tools.repository import RepoAccessError, inspect_repository, verify_repository
+from app.tools.web_search import WebSearchError
+from app.tools.workspace import (
+    WorkspaceError, planned_paths, prepare_workspace,
 )
-from app.discovery_tools import run_discovery_tool
-from app.kb_tools import KnowledgeBaseError
-from app.repo_tools import RepoAccessError, inspect_repository, verify_repository
-from app.state import AgentState, SupervisorTarget
-from app.tools import WebSearchError
-from app.workspace_tools import (
-    WorkspaceError, apply_edits, planned_paths, prepare_workspace, verify_workspace,
-)
+from app.workflow.state import AgentState, SupervisorTarget
 
 
-OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs"
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
 MAX_REVISIONS = 2
 MAX_CODE_REVISIONS = 2
 MAX_RESEARCH_ROUNDS = 2
@@ -145,21 +146,14 @@ def discovery_tool_node(state: AgentState) -> dict:
         )
         observation = result.observation[:5000]
         repo_root = result.repo_root or state.get("repo_root")
-        sources = list(state.get("sources", []))
-        seen = {source["locator"] for source in sources}
-        for item in result.sources:
-            if item["locator"] in seen or not item["snippet"].strip():
-                continue
-            # 对话可以持续多轮，但 checkpoint 里只保留有限的证据数量。
-            if len(sources) >= 12:
-                break
-            sources.append({"source_id": len(sources) + 1, **item})
-            seen.add(item["locator"])
+        sources = merge_discovery_sources(state["sources"], result.sources)
+        event = f"discovery_tool：{name} 已返回只读观察"
     except (RepoAccessError, KnowledgeBaseError, WebSearchError, ValueError) as exc:
         # 可选的探索查询失败不立即销毁整条会话；模型可以解释或请用户给路径。
         observation = f"工具 {name} 失败：{exc}"
         repo_root = state.get("repo_root")
-        sources = list(state.get("sources", []))
+        sources = state["sources"]
+        event = f"discovery_tool：{name} 失败，交 Intake 说明或澄清"
     return {
         "intake_status": "collecting",
         "next_step": "intake",
@@ -168,7 +162,7 @@ def discovery_tool_node(state: AgentState) -> dict:
         "discovery_observations": (state.get("discovery_observations", []) + [f"{name}: {observation}"])[-8:],
         "repo_root": repo_root,
         "sources": sources,
-        "events": [f"discovery_tool：{name} 已返回只读观察"],
+        "events": [event],
     }
 
 
@@ -201,6 +195,33 @@ def await_user_node(state: AgentState) -> dict:
     }
 
 
+def researcher_node(state: AgentState) -> dict:
+    """接收调研结果，只负责更新 State 和选择下一步。
+
+    取证、证据充分性判断、追问文案与报告生成都在 agents/researcher.py。
+    本节点不直接调用模型或搜索服务，也不拼接业务结论。
+    """
+
+    result = conduct_research(state)
+    if isinstance(result, ResearchNeedsInput):
+        return {
+            "sources": result.sources,
+            "research": None,
+            "research_report": None,
+            "research_question": result.question,
+            "next_step": "await_research_input",
+            "conversation": state["conversation"] + [{"role": "assistant", "text": result.question}],
+            "events": ["researcher：关键依据不足，暂停并请用户补充"],
+        }
+    return {
+        "sources": result.sources,
+        "research": result.research,
+        "research_report": result.report,
+        "next_step": "assess_research",
+        "events": [f"researcher：{result.event_detail}"],
+    }
+
+
 def await_research_input_node(state: AgentState) -> dict:
     """调研缺关键依据时暂停，收到用户说明后保留为可引用的用户来源。
 
@@ -222,15 +243,7 @@ def await_research_input_node(state: AgentState) -> dict:
     message = response["message"].strip()
     if not message or len(message) > 1000:
         raise ValueError("单条补充消息长度必须在 1～1000 字符之间")
-    source_id = max((source["source_id"] for source in state["sources"]), default=0) + 1
-    user_source = {
-        "source_id": source_id,
-        "source_type": "user",
-        "title": "用户补充",
-        "locator": f"conversation/{state['task_id']}#research-answer",
-        "snippet": message,
-        "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
+    user_source = user_research_source(state["sources"], state["task_id"], message)
     return {
         "conversation": state["conversation"] + [{"role": "user", "text": message}],
         "sources": state["sources"] + [user_source],
@@ -241,7 +254,21 @@ def await_research_input_node(state: AgentState) -> dict:
     }
 
 
-# 调研和产品方案节点定义在 agents.py；下面是第一道人审与方案落盘。
+def product_planner_node(state: AgentState) -> dict:
+    """把校验后的产品方案写入 State，交由 Supervisor 派发人工审核。"""
+
+    plan = build_product_plan(state)
+    return {
+        "draft_plan": plan.markdown,
+        "acceptance_criteria": plan.acceptance_criteria,
+        "open_questions": plan.open_questions,
+        "review_status": "pending",
+        "next_step": "assess_plan",
+        "events": [f"product_planner：生成方案，包含 {len(plan.acceptance_criteria)} 条验收标准"],
+    }
+
+
+# 第一道人审与方案落盘。
 def review_node(state: AgentState) -> dict:
     """只暂停和接收决定；写文件等副作用必须放到后续节点。"""
 
@@ -305,13 +332,12 @@ def save_node(state: AgentState) -> dict:
     if not research or not proposal:
         raise ValueError("调研报告或最终方案为空")
 
-    task_id = state["task_id"]
-    directory = _task_output_dir(task_id)
-    _write_once(directory / "research.md", research)
-    _write_once(directory / "proposal.md", proposal)
+    research_path, proposal_path = save_reports(
+        OUTPUT_DIR, state["task_id"], research, proposal,
+    )
     return {
-        "research_path": f"outputs/{task_id}/research.md",
-        "proposal_path": f"outputs/{task_id}/proposal.md",
+        "research_path": research_path,
+        "proposal_path": proposal_path,
         "next_step": "finish" if state["mode"] == "proposal_only" else "repo_inspector",
         "events": ["save：已保存调研报告与产品方案"],
     }
@@ -384,11 +410,9 @@ def save_change_plan_node(state: AgentState) -> dict:
     plan = state["change_plan"]
     if state["review_status"] != "approved" or not plan:
         raise ValueError("没有可保存的文件级变更计划")
-    task_id = state["task_id"]
-    directory = _task_output_dir(task_id)
-    _write_once(directory / "change_plan.md", plan)
+    path = save_change_plan(OUTPUT_DIR, state["task_id"], plan)
     return {
-        "change_plan_path": f"outputs/{task_id}/change_plan.md",
+        "change_plan_path": path,
         "next_step": "workspace_prepare",
         "events": ["save：已保存文件级变更计划"],
     }
@@ -426,47 +450,34 @@ def workspace_prepare_node(state: AgentState) -> dict:
 
 
 def coder_node(state: AgentState) -> dict:
-    """生成候选文件、保存 diff，然后将任务交给第二个人工门禁。
+    """调用隔离候选服务，把产物写入 State 后交给第二个人工门禁。
 
-    模型没有文件操作权限，只返回结构化的完整文件内容；程序负责验证
-    路径、语法、大小和哈希。所有写入只发生在任务专属工作区与 diff
-    输出目录，绝不直接覆盖已选原仓库，也不执行测试或 Git 提交。
+    模型调用、工作区复位、文件校验和 diff 保存由 candidate_delivery
+    完成；本节点只检查进入门槛、处理失败和决定下一步。
     """
 
     context = state["repo_context"]
     plan = state["change_plan"]
     if state["review_status"] != "approved" or context is None or not plan or not state["workspace_path"]:
         raise ValueError("方案未批准，或缺少仓库快照、文件级计划及隔离工作区")
-    attempt = state.get("code_revision_count", 0)
     try:
-        paths = planned_paths(plan)
-        # 中断或超时后可以再次运行该节点：先复位，再让模型重新生成。
-        # 因此不会把上一次不完整的文件当成新一轮修改的输入。
-        workspace, baseline = prepare_workspace(context, state["task_id"], attempt)
-        draft = generate_code_patch(state, baseline, paths)
-        actual_workspace, diff, hashes = apply_edits(
-            context, state["task_id"], attempt,
-            [edit.model_dump() for edit in draft.edits], paths,
-        )
-        if workspace != actual_workspace:
-            raise WorkspaceError("隔离工作区路径不一致")
-        diff_path = _write_diff(state["task_id"], attempt, diff)
+        candidate = generate_candidate(state, OUTPUT_DIR)
     except (RepoAccessError, WorkspaceError, ValueError) as exc:
         return {
             "workflow_status": "blocked", "error": str(exc), "next_step": None,
             "events": [f"coder：停止，{exc}"],
         }
     return {
-        "workspace_path": workspace,
-        "diff_path": diff_path,
-        "diff": diff,
-        "file_hashes": hashes,
-        "code_summary": draft.summary.strip(),
+        "workspace_path": candidate.workspace_path,
+        "diff_path": candidate.diff_path,
+        "diff": candidate.diff,
+        "file_hashes": candidate.file_hashes,
+        "code_summary": candidate.summary,
         "code_review_status": "pending",
         "workflow_status": "diff_pending",
         "next_step": "diff_review",
         "error": None,
-        "events": [f"coder：生成 {len(hashes)} 个候选文件和 diff；未运行测试、未提交"],
+        "events": [f"coder：生成 {len(candidate.file_hashes)} 个候选文件和 diff；未运行测试、未提交"],
     }
 
 
@@ -477,11 +488,12 @@ def diff_review_node(state: AgentState) -> dict:
     退回时记录反馈并进入下一次独立尝试；终止时不碰原仓库。
     """
 
-    if state.get("code_review_status") != "pending" or not state.get("diff"):
+    diff = state["diff"]
+    if state.get("code_review_status") != "pending" or not diff:
         raise ValueError("当前没有可审核的代码 diff")
     decision = interrupt({
         "task_id": state["task_id"],
-        "diff": state["diff"],
+        "diff": diff,
         "diff_path": state["diff_path"],
         "workspace_path": state["workspace_path"],
         "file_hashes": state["file_hashes"],
@@ -493,7 +505,10 @@ def diff_review_node(state: AgentState) -> dict:
     action = decision.get("action")
     if action == "approve":
         try:
-            _verify_diff_candidate(state)
+            verify_diff_candidate(
+                OUTPUT_DIR, state["task_id"], state["code_revision_count"],
+                diff, state["repo_context"], state["file_hashes"],
+            )
         except (RepoAccessError, WorkspaceError) as exc:
             return {
                 "workflow_status": "blocked", "error": str(exc), "next_step": None,
@@ -634,66 +649,6 @@ def _finish_intake(state: AgentState, request: str, reply: str | None) -> dict:
     }
 
 
-def _task_output_dir(task_id: str) -> Path:
-    """所有任务产物只写到固定的 outputs/<任务ID>，不跟随链接目录。"""
-
-    if not re.fullmatch(r"[0-9a-f]{32}", task_id):
-        raise ValueError("任务 ID 格式不正确")
-    directory = OUTPUT_DIR / task_id
-    if any(path.is_symlink() or path.is_junction() for path in (OUTPUT_DIR, directory)):
-        raise WorkspaceError("任务输出目录不能是链接或 junction")
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-def _write_once(path: Path, content: str) -> None:
-    """重试时同内容视为成功，不覆盖已有的不同批准版本。"""
-
-    content = content.rstrip() + "\n"
-    temp = path.with_suffix(path.suffix + ".tmp")
-    if any(item.is_symlink() or item.is_junction() for item in (path, temp)):
-        raise WorkspaceError("任务输出文件不能是链接或 junction")
-    if path.exists():
-        if path.read_text(encoding="utf-8") != content:
-            raise FileExistsError(f"已存在不同内容的批准文件：{path}")
-        return
-    temp.write_text(content, encoding="utf-8")
-    temp.replace(path)
-
-
-def _write_diff(task_id: str, attempt: int, diff: str) -> str:
-    """只把候选 diff 写到 Agent 项目的输出目录，拒绝链接路径。"""
-
-    directory = _task_output_dir(task_id)
-    # 每次退回使用新 attempt；保留旧补丁，便于人工对照修改前后。
-    target = directory / f"diff-attempt-{attempt}.patch"
-    temp = target.with_suffix(".patch.tmp")
-    if any(path.is_symlink() or path.is_junction() for path in (target, temp)):
-        raise WorkspaceError("diff 输出文件不能是链接或 junction")
-    temp.write_text(diff, encoding="utf-8")
-    temp.replace(target)
-    return f"outputs/{task_id}/{target.name}"
-
-
-def _verify_diff_candidate(state: AgentState) -> None:
-    """批准前重查补丁、原仓库和候选工作区，防止审核期间内容被替换。"""
-
-    context = state["repo_context"]
-    if context is None:
-        raise WorkspaceError("缺少仓库基线，不能批准 diff")
-    diff_file = OUTPUT_DIR / state["task_id"] / f"diff-attempt-{state['code_revision_count']}.patch"
-    if (
-        OUTPUT_DIR.is_symlink() or OUTPUT_DIR.is_junction()
-        or diff_file.parent.is_symlink() or diff_file.parent.is_junction()
-        or not diff_file.is_file() or diff_file.is_symlink() or diff_file.is_junction()
-        or diff_file.read_text(encoding="utf-8") != state["diff"]
-    ):
-        raise WorkspaceError("待审核 diff 文件在审核期间变化")
-    verify_workspace(
-        context, state["task_id"], state["code_revision_count"], state["file_hashes"],
-    )
-
-
 # 3. 图装配：注册节点并连接所有派工与停止边。
 def build_graph(checkpointer):
     """组装唯一的产品交付工作流，并绑定可恢复的 checkpointer。
@@ -710,8 +665,8 @@ def build_graph(checkpointer):
     builder.add_node("intake", intake_node)
     builder.add_node("discovery_tool", discovery_tool_node)
     builder.add_node("await_user", await_user_node)
-    builder.add_node("await_research_input", await_research_input_node)
     builder.add_node("researcher", researcher_node)
+    builder.add_node("await_research_input", await_research_input_node)
     builder.add_node("product_planner", product_planner_node)
     builder.add_node("review", review_node)
     builder.add_node("save", save_node)

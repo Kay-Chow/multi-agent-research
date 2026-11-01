@@ -5,8 +5,12 @@ from unittest.mock import Mock, patch
 
 from pydantic import ValidationError
 
-from app import agents
-from app.state import initial_chat_state, initial_state
+from app.agents import intake as intake_agent
+from app.agents import planner as planning_agent
+from app.agents import researcher as research_agent
+from app.agents import supervisor as supervisor_agent
+from app.workflow import graph as agent_graph
+from app.workflow.state import initial_chat_state, initial_state
 
 
 class FakeModel:
@@ -92,8 +96,8 @@ class AgentTests(unittest.TestCase):
 
     def test_supervisor_classification_is_structured(self):
         model = FakeModel({"ModeDecision": {"mode": "code_change", "reason": "需要修改代码"}})
-        with patch.object(agents, "_model", return_value=model):
-            self.assertEqual(agents.decide_mode("实现筛选").mode, "code_change")
+        with patch.object(intake_agent, "create_model", return_value=model):
+            self.assertEqual(intake_agent.decide_mode("实现筛选").mode, "code_change")
 
     def test_supervisor_can_choose_another_research_round(self):
         """有两条安全路线时，Supervisor 的结构化决定确实影响下一节点。"""
@@ -104,8 +108,8 @@ class AgentTests(unittest.TestCase):
         model = FakeModel({"SupervisorDecision": {
             "next_agent": "researcher", "reason": "先补查业务背景",
         }})
-        with patch.object(agents, "_model", return_value=model):
-            decision = agents.decide_next(state, ["product_planner", "researcher"])
+        with patch.object(supervisor_agent, "create_model", return_value=model):
+            decision = supervisor_agent.decide_next(state, ["product_planner", "researcher"])
         self.assertEqual(decision.next_agent, "researcher")
 
     def test_supervisor_invalid_choice_falls_back_to_safe_route(self):
@@ -117,10 +121,10 @@ class AgentTests(unittest.TestCase):
         bound_model.invoke.return_value = {"next_agent": "coder", "reason": "越过审核"}
         model = Mock()
         model.with_structured_output.return_value = bound_model
-        with patch.object(agents, "_model", return_value=model), self.assertLogs(
-            agents.logger, level="WARNING"
+        with patch.object(supervisor_agent, "create_model", return_value=model), self.assertLogs(
+            supervisor_agent.logger, level="WARNING"
         ) as logs:
-            decision = agents.decide_next(state, ["review", "researcher"])
+            decision = supervisor_agent.decide_next(state, ["review", "researcher"])
         self.assertEqual(decision.next_agent, "review")
         self.assertEqual(bound_model.invoke.call_count, 2)
         self.assertEqual(len(logs.records), 2)
@@ -128,8 +132,8 @@ class AgentTests(unittest.TestCase):
     def test_supervisor_single_safe_route_does_not_call_model(self):
         """保存等必经步骤由程序强制执行，不为无选择的步骤额外花模型调用。"""
 
-        with patch.object(agents, "_model") as model:
-            decision = agents.decide_next(initial_state("只写方案"), ["save"])
+        with patch.object(supervisor_agent, "create_model") as model:
+            decision = supervisor_agent.decide_next(initial_state("只写方案"), ["save"])
         self.assertEqual(decision.next_agent, "save")
         model.assert_not_called()
 
@@ -147,12 +151,12 @@ class AgentTests(unittest.TestCase):
         ]
         for data in invalid_decisions:
             with self.subTest(data=data), self.assertRaises(ValidationError):
-                agents.IntakeDecision.model_validate(data)
+                intake_agent.IntakeDecision.model_validate(data)
 
         # 查资料时不需要给用户回复；正常回答时则必须有回复。
-        tool_decision = agents.IntakeDecision(ready=False, tool_name="search_kb", tool_query="需求背景")
-        answer_decision = agents.IntakeDecision(ready=False, reply="请说说你想解决什么问题？")
-        ready_decision = agents.IntakeDecision(ready=True, request="调研反馈筛选")
+        tool_decision = intake_agent.IntakeDecision(ready=False, tool_name="search_kb", tool_query="需求背景")
+        answer_decision = intake_agent.IntakeDecision(ready=False, reply="请说说你想解决什么问题？")
+        ready_decision = intake_agent.IntakeDecision(ready=True, request="调研反馈筛选")
         self.assertEqual(tool_decision.tool_name, "search_kb")
         self.assertIsNone(answer_decision.tool_name)
         self.assertEqual(ready_decision.reply, "")
@@ -167,10 +171,10 @@ class AgentTests(unittest.TestCase):
         ]
         model = Mock()
         model.with_structured_output.return_value = bound_model
-        with patch.object(agents, "_model", return_value=model), self.assertLogs(
-            agents.logger, level="WARNING"
+        with patch.object(intake_agent, "create_model", return_value=model), self.assertLogs(
+            intake_agent.logger, level="WARNING"
         ) as logs:
-            result = agents.intake_requirement(initial_chat_state("我想做个需求"))
+            result = intake_agent.intake_requirement(initial_chat_state("我想做个需求"))
         self.assertIn("方案", result.reply)
         self.assertEqual(bound_model.invoke.call_count, 2)
         self.assertIn("上一条决定不符合", bound_model.invoke.call_args.args[0][-1][1])
@@ -186,11 +190,11 @@ class AgentTests(unittest.TestCase):
         bound_model.invoke.return_value = {"ready": False, "reply": ""}
         model = Mock()
         model.with_structured_output.return_value = bound_model
-        with patch.object(agents, "_model", return_value=model), self.assertLogs(
-            agents.logger, level="WARNING"
+        with patch.object(intake_agent, "create_model", return_value=model), self.assertLogs(
+            intake_agent.logger, level="WARNING"
         ) as logs:
-            with self.assertRaises(agents.IntakeDecisionError):
-                agents.intake_requirement(initial_chat_state("你好"))
+            with self.assertRaises(intake_agent.IntakeDecisionError):
+                intake_agent.intake_requirement(initial_chat_state("你好"))
         self.assertEqual(bound_model.invoke.call_count, 2)
         self.assertEqual(len(logs.records), 2)
 
@@ -201,9 +205,9 @@ class AgentTests(unittest.TestCase):
         bound_model.invoke.side_effect = RuntimeError("模型服务暂不可用")
         model = Mock()
         model.with_structured_output.return_value = bound_model
-        with patch.object(agents, "_model", return_value=model):
+        with patch.object(intake_agent, "create_model", return_value=model):
             with self.assertRaisesRegex(RuntimeError, "模型服务暂不可用"):
-                agents.intake_requirement(initial_chat_state("你好"))
+                intake_agent.intake_requirement(initial_chat_state("你好"))
         bound_model.invoke.assert_called_once()
 
     def test_research_without_results_marks_evidence_gap(self):
@@ -214,12 +218,12 @@ class AgentTests(unittest.TestCase):
         }})
         state = initial_state("反馈筛选")
         state["research_clarified"] = True
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_web", return_value=[]
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_web", return_value=[]
         ), patch.object(
-            agents, "search_knowledge_base", return_value=[]
+            research_agent, "search_knowledge_base", return_value=[]
         ):
-            result = agents.researcher_node(state)
+            result = agent_graph.researcher_node(state)
         self.assertEqual(result["sources"], [])
         self.assertIn("证据不足", result["research"])
         self.assertIn("没有相关命中", result["research_report"])
@@ -232,13 +236,13 @@ class AgentTests(unittest.TestCase):
             "ResearchBrief": {"findings": [{"claim": "结论", "source_id": 99}]},
         })
         hits = [{"title": "资料", "url": "https://example.com", "snippet": "摘要"}]
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_web", return_value=hits
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_web", return_value=hits
         ), patch.object(
-            agents, "search_knowledge_base", return_value=[]
+            research_agent, "search_knowledge_base", return_value=[]
         ):
             with self.assertRaisesRegex(ValueError, "不存在的来源"):
-                agents.researcher_node(initial_state("反馈筛选"))
+                agent_graph.researcher_node(initial_state("反馈筛选"))
 
     def test_irrelevant_sources_prompt_user_instead_of_drafting(self):
         """来源虽非空但无有效要点时先求证，不把无关资料硬凑成方案。"""
@@ -253,47 +257,47 @@ class AgentTests(unittest.TestCase):
             "SearchQueries": {"knowledge_queries": [], "web_queries": []},
             "ResearchBrief": {"findings": []},
         })
-        with patch.object(agents, "_model", return_value=model):
-            result = agents.researcher_node(state)
+        with patch.object(research_agent, "create_model", return_value=model):
+            result = agent_graph.researcher_node(state)
         self.assertIsNone(result["research_report"])
         self.assertIn("资料不足以支持明确结论", result["research_question"])
 
     def test_plan_rejects_fabricated_source_id(self):
         data = self.plan_data()
         data["source_ids"] = [2]
-        with patch.object(agents, "_model", return_value=FakeModel({
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({
             "ProductPlanDraft": data
         })):
             with self.assertRaisesRegex(ValueError, "不存在的来源"):
-                agents.product_planner_node(self.ready_state())
+                agent_graph.product_planner_node(self.ready_state())
 
     def test_plan_requires_acceptance_criteria(self):
         data = self.plan_data()
         data["acceptance_criteria"] = []
-        with patch.object(agents, "_model", return_value=FakeModel({
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({
             "ProductPlanDraft": data
         })):
             with self.assertRaises(ValidationError):
-                agents.product_planner_node(self.ready_state())
+                agent_graph.product_planner_node(self.ready_state())
 
     def test_no_source_requires_open_question(self):
         data = self.plan_data()
         data["source_ids"] = []
         data["open_questions"] = []
-        with patch.object(agents, "_model", return_value=FakeModel({
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({
             "ProductPlanDraft": data
         })):
             with self.assertRaisesRegex(ValueError, "待确认问题"):
-                agents.product_planner_node(self.ready_state(with_source=False))
+                agent_graph.product_planner_node(self.ready_state(with_source=False))
 
     def test_web_only_plan_requires_internal_background_question(self):
         data = self.plan_data()
         data["open_questions"] = []
-        with patch.object(agents, "_model", return_value=FakeModel({
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({
             "ProductPlanDraft": data
         })):
             with self.assertRaisesRegex(ValueError, "知识库没有相关来源"):
-                agents.product_planner_node(self.ready_state())
+                agent_graph.product_planner_node(self.ready_state())
 
     def test_research_merges_kb_and_web_with_distinct_citations(self):
         model = FakeModel({
@@ -312,10 +316,10 @@ class AgentTests(unittest.TestCase):
             "snippet": "GET /feedback 尚无筛选",
         }]
         web_hits = [{"title": "公开资料", "url": "https://example.com", "snippet": "摘要"}]
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", return_value=kb_hits
-        ), patch.object(agents, "search_web", return_value=web_hits):
-            result = agents.researcher_node(initial_state("增加反馈列表筛选"))
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", return_value=kb_hits
+        ), patch.object(research_agent, "search_web", return_value=web_hits):
+            result = agent_graph.researcher_node(initial_state("增加反馈列表筛选"))
         self.assertEqual([source["source_type"] for source in result["sources"]],
                          ["knowledge_base", "web"])
         self.assertIn("本地知识库片段", result["research_report"])
@@ -342,10 +346,10 @@ class AgentTests(unittest.TestCase):
             "SearchQueries": {"knowledge_queries": [], "web_queries": []},
             "ResearchBrief": {"findings": [{"claim": "当前列表没有筛选", "source_id": 1}]},
         })
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", side_effect=AssertionError("不应重复查 KB")
-        ), patch.object(agents, "search_web", side_effect=AssertionError("不应重复联网")):
-            result = agents.researcher_node(state)
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", side_effect=AssertionError("不应重复查 KB")
+        ), patch.object(research_agent, "search_web", side_effect=AssertionError("不应重复联网")):
+            result = agent_graph.researcher_node(state)
         self.assertEqual(result["sources"], state["sources"])
         self.assertIn("已选仓库文件", result["research_report"])
         self.assertIn("[1]", result["research"])
@@ -369,10 +373,10 @@ class AgentTests(unittest.TestCase):
             "title": "优先级规则", "locator": "demo/priority#chunk-0",
             "snippet": "high、medium、low 三档",
         }]
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", return_value=new_hit
-        ) as kb, patch.object(agents, "search_web") as web:
-            result = agents.researcher_node(state)
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", return_value=new_hit
+        ) as kb, patch.object(research_agent, "search_web") as web:
+            result = agent_graph.researcher_node(state)
         self.assertEqual([item["source_id"] for item in result["sources"]], [1, 2])
         self.assertIn("[2]", result["research"])
         kb.assert_called_once_with("反馈优先级规则")
@@ -385,10 +389,10 @@ class AgentTests(unittest.TestCase):
             "knowledge_queries": ["反馈列表"], "web_queries": ["反馈列表"],
             "internal_facts_required": True,
         }})
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", side_effect=agents.KnowledgeBaseError("连接失败")
-        ), patch.object(agents, "search_web", return_value=[]) as web:
-            result = agents.researcher_node(initial_state("反馈列表"))
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", side_effect=research_agent.KnowledgeBaseError("连接失败")
+        ), patch.object(research_agent, "search_web", return_value=[]) as web:
+            result = agent_graph.researcher_node(initial_state("反馈列表"))
         self.assertNotIn("workflow_status", result)
         self.assertIn("知识库暂不可用", result["research_question"])
         self.assertIsNone(result["research_report"])
@@ -401,10 +405,10 @@ class AgentTests(unittest.TestCase):
             "knowledge_queries": ["内部审批规则"], "web_queries": ["公开参考"],
             "internal_facts_required": True,
         }})
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", return_value=[]
-        ), patch.object(agents, "search_web", return_value=[]) as web:
-            result = agents.researcher_node(initial_state("依据内部审批规则设计流程"))
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", return_value=[]
+        ), patch.object(research_agent, "search_web", return_value=[]) as web:
+            result = agent_graph.researcher_node(initial_state("依据内部审批规则设计流程"))
         self.assertNotIn("workflow_status", result)
         self.assertIn("请补充相关规则或文档", result["research_question"])
         self.assertIsNone(result["research_report"])
@@ -428,10 +432,10 @@ class AgentTests(unittest.TestCase):
             },
             "ResearchBrief": {"findings": [{"claim": "只允许 high 和 low", "source_id": 1}]},
         })
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", side_effect=agents.KnowledgeBaseError("连接失败")
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", side_effect=research_agent.KnowledgeBaseError("连接失败")
         ):
-            result = agents.researcher_node(state)
+            result = agent_graph.researcher_node(state)
         self.assertIsNotNone(result["research_report"])
         self.assertIn("只允许 high 和 low [1]", result["research"])
         self.assertIn("用户补充（未经独立核验）", result["research_report"])
@@ -453,10 +457,10 @@ class AgentTests(unittest.TestCase):
             },
             "ResearchBrief": {"findings": [{"claim": "当前列表没有筛选", "source_id": 1}]},
         })
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", side_effect=agents.KnowledgeBaseError("连接失败")
-        ), patch.object(agents, "search_web") as web:
-            result = agents.researcher_node(state)
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", side_effect=research_agent.KnowledgeBaseError("连接失败")
+        ), patch.object(research_agent, "search_web") as web:
+            result = agent_graph.researcher_node(state)
         self.assertNotIn("workflow_status", result)
         self.assertEqual(result["sources"], state["sources"])
         self.assertIn("知识库检索失败：连接失败", result["research_report"])
@@ -471,10 +475,10 @@ class AgentTests(unittest.TestCase):
             "knowledge_queries": ["反馈列表"], "web_queries": ["反馈筛选设计"],
             "internal_facts_required": False,
         }})
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", side_effect=agents.KnowledgeBaseError("连接失败")
-        ), patch.object(agents, "search_web", return_value=[]) as web:
-            result = agents.researcher_node(initial_state("调研反馈筛选"))
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", side_effect=research_agent.KnowledgeBaseError("连接失败")
+        ), patch.object(research_agent, "search_web", return_value=[]) as web:
+            result = agent_graph.researcher_node(initial_state("调研反馈筛选"))
         self.assertNotIn("workflow_status", result)
         self.assertEqual(result["sources"], [])
         self.assertIsNone(result["research_report"])
@@ -495,22 +499,22 @@ class AgentTests(unittest.TestCase):
             "locator": "tech_notes_v1/demo/产品反馈列表背景.md#chunk-0",
             "snippet": "GET /feedback 尚无筛选",
         }]
-        with patch.object(agents, "_model", return_value=model), patch.object(
-            agents, "search_knowledge_base", return_value=kb_hits
+        with patch.object(research_agent, "create_model", return_value=model), patch.object(
+            research_agent, "search_knowledge_base", return_value=kb_hits
         ), patch.object(
-            agents, "search_web", side_effect=agents.WebSearchError("TLS 连接失败")
+            research_agent, "search_web", side_effect=research_agent.WebSearchError("TLS 连接失败")
         ):
-            result = agents.researcher_node(initial_state("增加反馈列表筛选"))
+            result = agent_graph.researcher_node(initial_state("增加反馈列表筛选"))
         self.assertEqual(len(result["sources"]), 1)
         self.assertEqual(result["sources"][0]["source_type"], "knowledge_base")
         self.assertIn("网页检索失败", result["research_report"])
         self.assertIn("公开背景待核验", result["research"])
 
     def test_valid_plan_contains_testable_criterion(self):
-        with patch.object(agents, "_model", return_value=FakeModel({
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({
             "ProductPlanDraft": self.plan_data()
         })):
-            result = agents.product_planner_node(self.ready_state())
+            result = agent_graph.product_planner_node(self.ready_state())
         self.assertIn("验收标准", result["draft_plan"])
         self.assertEqual(result["acceptance_criteria"], ["priority=high 时只返回 high 反馈"])
 
@@ -519,25 +523,25 @@ class AgentTests(unittest.TestCase):
 
         data = self.plan_data()
         data["risks"] = [" "]
-        with patch.object(agents, "_model", return_value=FakeModel({"ProductPlanDraft": data})):
-            result = agents.product_planner_node(self.ready_state())
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({"ProductPlanDraft": data})):
+            result = agent_graph.product_planner_node(self.ready_state())
         self.assertIn("## 风险\n- 暂无", result["draft_plan"])
         self.assertNotIn("\n- \n", result["draft_plan"])
 
     def test_change_plan_rejects_forbidden_file(self):
         data = self.change_plan_data()
         data["file_changes"][0]["path"] = ".env"
-        with patch.object(agents, "_model", return_value=FakeModel({
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({
             "ChangePlanDraft": data
         })):
             with self.assertRaisesRegex(ValueError, "不在白名单"):
-                agents.propose_change_plan(self.ready_change_state(), {"app/main.py": "app = 1"})
+                planning_agent.propose_change_plan(self.ready_change_state(), {"app/main.py": "app = 1"})
 
     def test_change_plan_lists_files_and_tests_without_writing(self):
-        with patch.object(agents, "_model", return_value=FakeModel({
+        with patch.object(planning_agent, "create_model", return_value=FakeModel({
             "ChangePlanDraft": self.change_plan_data()
         })):
-            plan = agents.propose_change_plan(
+            plan = planning_agent.propose_change_plan(
                 self.ready_change_state(), {"app/main.py": "app = 1"}
             )
         self.assertIn("`app/main.py`", plan)

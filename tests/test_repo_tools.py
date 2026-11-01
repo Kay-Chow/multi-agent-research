@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import repo_tools
+from app.tools import repository as repo_tools
 
 
 class RepoToolTests(unittest.TestCase):

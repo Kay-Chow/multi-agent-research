@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import workspace_tools as workspace
+from app.tools import workspace
 
 
 class WorkspaceTests(unittest.TestCase):

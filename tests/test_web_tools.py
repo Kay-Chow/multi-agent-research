@@ -7,7 +7,7 @@ from unittest.mock import patch
 from requests import ConnectionError as RequestsConnectionError
 from tavily.errors import TimeoutError as TavilyTimeoutError, UsageLimitExceededError
 
-from app import tools as web_tools
+from app.tools import web_search as web_tools
 
 
 class WebToolTests(unittest.TestCase):

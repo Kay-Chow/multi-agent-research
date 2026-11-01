@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import patch
 
-from app import discovery_tools
+from app.tools import discovery as discovery_tools
 
 
 class DiscoveryToolTests(unittest.TestCase):

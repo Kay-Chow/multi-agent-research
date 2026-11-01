@@ -63,7 +63,7 @@ PyCharm 的 Python 运行配置选择 **Module name**：`app.main`，工作目�
 & $python -m app.main
 ```
 
-启动后直接说话即可；问候会自然引导，问“演示项目在哪”可以先调用受限仓库发现工具回答，不必马上创建正式需求。具体需求也可先查本地文件、知识库或公开资料；工具选择由模型决定，但实际读取范围由 Python 校验。若只说“我想做一个需求”，Supervisor 会让 Intake 追问具体问题，不会进入正式调研。下一句用同一 thread_id 恢复；观察结果、来源和选定仓库保存在 SQLite checkpoint。只有需求明确后才写入正式 `request` 并生成方案。HTTP 创建任务入口提供完整需求，仍会跳过接待；代码任务需在请求体提供 `repo_root`。
+启动后直接说话即可；问候会自然引导，问“演示项目在哪”可以先调用受限仓库发现工具回答，不必马上创建正式需求。具体需求也可先查本地文件、知识库或公开资料；工具选择由模型决定，但实际读取范围由 Python 校验。若只说“我想做一个需求”，Supervisor 会让 Intake 追问具体问题，不会进入正式调研。下一句用同一 thread_id 恢复；观察结果、来源和选定仓库保存在 SQLite checkpoint。只有需求明确后才写入正式 `request` 并生成方案。**“先看方案，批准后再生成代码和 diff”仍属于 `code_change`**；只有明确只要方案或没有委托本次任务写代码时才是 `proposal_only`。HTTP 创建任务入口已提供完整需求，会跳过对话澄清，但仍由 Intake 确认模式；代码任务需在请求体提供 `repo_root`。
 
 需要继续旧会话时，输入“继续上次对话”或 `/recent` 可列出最近待继续会话的摘要与 ID，再用 `/resume 会话ID` 回到原 checkpoint。恢复旧会话先由命令行选择旧 `thread_id`，**不会新建一个 Intake 任务，也不会自动猜测要恢复哪一项**。调研缺资料时直接回复 Agent 的问题即可；补充内容作为用户来源记录，再由 Researcher 整理。方案与代码 diff 仍分别需要人工明确审核，例如输入“批准”“退回 补充验收标准”或“终止”；“好的”不会被当作批准。`/status` 查看当前状态，`/new` 开始另一项需求，`/retry` 在修复外部服务后按相同需求新建任务，`/exit` 退出对话。已创建会话的 checkpoint 会保留。本地知识库服务不是启动工作流的前提；不可用时会标出局限，关键事实缺失时请用户补充。
 
@@ -95,27 +95,43 @@ PyCharm 的 Python 运行配置选择 **Module name**：`app.main`，工作目�
 
 自动化测试使用假模型、假搜索和假知识库响应，不消耗外部 API 配额。关键边界包括 Supervisor 从 START 管理 Intake 与工具、正式 Worker 回环与补查上限、越级派工拒绝、仓库/知识库/网页/用户四类来源、授权仓库范围、资料缺口时的用户补充与恢复、两次人工审核、SQLite 重启恢复、HTTP 流程、越权路径、空/超大 diff、工作区或 diff 被调包及退回次数上限。
 
-读代码建议按这条主线走：`main.py` 启动 → `chat_cli.py`/`api.py` 接收输入 → `state.py` 建状态 → `graph.py` 决定工具回环及审核暂停 → `agents.py` 让模型作结构化决定 → `discovery_tools.py` 运行受限只读工具 → `repo_tools.py`/`workspace_tools.py` 检查并生成隔离候选。`config.py` 只放数据库路径和 `thread_id` 配置。
+读代码建议按这条主线走：`main.py` 启动 → `chat_cli.py`/`api.py` 接收输入 → `workflow/state.py` 建状态 → `workflow/graph.py` 负责节点与路由 → `agents/` 下按角色阅读 Intake、Supervisor、Researcher、Planner、Coder → `tools/` 下查看只读查询与隔离工作区能力 → `services/` 处理来源、候选代码及产物保存。`config.py` 只放数据库路径和 `thread_id` 配置。
+
+以调研为例：`agents/researcher.py` 的 `conduct_research` 完成检索、证据判断和报告生成，返回“需要用户补充”或“调研完成”；`workflow/graph.py` 的 `researcher_node` 只把这一结果写入 State，并设置下一步。
 
 ```text
 app/
-  config.py   数据库路径与 LangGraph thread_id 配置
-  state.py    任务状态
-  prompts.py  角色提示词
-  agents.py   探索接待 / Supervisor / Researcher / Product Planner / Change Planner / Coder
-  graph.py    LangGraph 工具回环、两次审核、仓库分析与隔离改动
-  discovery_tools.py  只读仓库文件、知识库与网页工具调度
-  repo_tools.py  授权项目目录内的仓库发现、只读检查与路径校验
-  workspace_tools.py  隔离工作区、完整文件校验、diff 与哈希检查
-  kb_tools.py    本机 RAG 检索接口客户端
-  tools.py    Tavily 搜索封装
-  main.py     启动入口（打开 SQLite 并构建图）
-  chat_cli.py 终端聊天、状态展示与会话恢复
-  api.py      FastAPI 入口
+  agents/
+    intake.py        需求澄清、只读工具选择与任务模式判断
+    supervisor.py    在图允许的候选节点中选择下一步
+    researcher.py    检索、来源校验与调研报告
+    planner.py       产品方案与文件级变更计划
+    coder.py         结构化候选文件内容
+    model_client.py  统一创建 DeepSeek 模型客户端
+    prompts.py       各角色提示词
+  tools/
+    discovery.py     接待阶段的只读工具调度
+    knowledge_base.py 本机 RAG 检索接口客户端
+    web_search.py    Tavily 搜索封装
+    repository.py    授权仓库发现、只读检查与路径校验
+    workspace.py     隔离工作区、文件校验、diff 与哈希检查
+  workflow/
+    graph.py         LangGraph 节点、状态流转与两次人工审核
+    state.py         任务共享状态
+  services/
+    evidence.py      来源去重、编号与用户补充来源
+    candidate_delivery.py  组织模型候选、隔离文件改动与待审 diff
+    artifact_store.py  报告/方案/补丁落盘及批准前防篡改核验
+  config.py          数据库路径与 LangGraph thread_id 配置
+  main.py            启动入口（打开 SQLite 并构建图）
+  chat_cli.py        终端聊天、状态展示与会话恢复
+  api.py             FastAPI 入口
 tests/        自动化测试
 data/         SQLite checkpoint（Git 忽略）
 outputs/      报告、方案、变更计划及待审核 diff（Git 忽略）
 ```
+
+`main.py`、`api.py` 和 `chat_cli.py` 留在 `app/` 顶层作为入口，现有 PyCharm 与 Uvicorn 启动命令不需要改变。
 
 ## 仓库与工作区边界
 

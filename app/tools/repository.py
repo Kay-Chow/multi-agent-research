@@ -7,13 +7,14 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from dotenv import load_dotenv
 
-from app.state import RepoContext, RepoFile
+from app.config import PROJECT_ROOT
+from app.workflow.state import RepoContext, RepoFile
 
 
 # 可以在启动前通过环境变量改为另一个项目目录；模型不能自行扩大此范围。
 # 当前只允许选择该目录的直接子目录作为仓库，不扫描整块磁盘。
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-PROJECTS_ROOT = Path(os.getenv("AGENT_PROJECTS_ROOT") or Path(__file__).resolve().parents[2])
+load_dotenv(PROJECT_ROOT / ".env")
+PROJECTS_ROOT = Path(os.getenv("AGENT_PROJECTS_ROOT") or PROJECT_ROOT.parent)
 # 代码生成阶段暂时仍限于这个演示工程布局；接待阶段可安全读取其他已选仓库的文本。
 READ_ALLOWLIST = ("README.md", "requirements.txt", "app/main.py", "tests/test_feedback.py")
 CHANGE_ALLOWLIST = frozenset({"app/main.py", "tests/test_feedback.py", "README.md"})

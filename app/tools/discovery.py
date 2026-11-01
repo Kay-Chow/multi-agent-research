@@ -6,9 +6,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
-from app.kb_tools import search_knowledge_base
-from app.repo_tools import inspect_project, list_repositories, read_repository_text
-from app.tools import search_web
+from app.tools.knowledge_base import search_knowledge_base
+from app.tools.repository import inspect_project, list_repositories, read_repository_text
+from app.tools.web_search import search_web
 
 
 ToolName = Literal["list_projects", "inspect_project", "read_file", "search_kb", "search_web"]

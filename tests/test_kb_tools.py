@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import httpx
 
-from app import kb_tools
+from app.tools import knowledge_base as kb_tools
 
 
 class FakeResponse:

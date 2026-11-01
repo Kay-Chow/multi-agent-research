@@ -11,7 +11,7 @@ if not __package__:
 
 from app.chat_cli import chat
 from app.config import DB_PATH
-from app.graph import build_graph
+from app.workflow.graph import build_graph
 
 
 def main() -> None:

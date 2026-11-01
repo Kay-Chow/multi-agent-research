@@ -3,14 +3,16 @@
 import math
 import os
 import re
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 import httpx
 from dotenv import load_dotenv
 
+from app.config import PROJECT_ROOT
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 DEFAULT_KB_URL = "http://127.0.0.1:8002/retrieve"
 # 重排分只是相关性启发式，不是概率；当前阈值用来过滤 Java 笔记等明显跑题的命中。

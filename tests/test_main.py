@@ -11,8 +11,9 @@ from unittest.mock import Mock, patch
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app import chat_cli, main
-from app import graph as agent_graph
-from app.agents import IntakeDecision, ModeDecision, SupervisorDecision
+from app.workflow import graph as agent_graph
+from app.agents.intake import IntakeDecision, ModeDecision
+from app.agents.supervisor import SupervisorDecision
 from app.chat_cli import _blocked_request, _recent_resumable, _review_reply, _wants_previous_chat
 from app.config import task_config
 

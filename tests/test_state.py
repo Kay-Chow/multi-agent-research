@@ -2,7 +2,7 @@
 
 import unittest
 
-from app.state import initial_chat_state, initial_state
+from app.workflow.state import initial_chat_state, initial_state
 
 
 class StateTests(unittest.TestCase):

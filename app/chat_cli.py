@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from langgraph.types import Command
 
 from app.config import PROJECT_ROOT, task_config
-from app.state import initial_chat_state, initial_state
+from app.workflow.state import initial_chat_state, initial_state
 
 
 INTRO = (

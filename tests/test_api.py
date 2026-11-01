@@ -8,8 +8,11 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app import api, graph
-from app.agents import CodePatchDraft, SupervisorDecision
+from app import api
+from app.services import artifact_store, candidate_delivery
+from app.workflow import graph
+from app.agents.coder import CodePatchDraft
+from app.agents.supervisor import SupervisorDecision
 
 
 class ApiTests(unittest.TestCase):
@@ -171,18 +174,19 @@ class ApiTests(unittest.TestCase):
             stack.enter_context(patch.object(
                 graph, "propose_change_plan", return_value="# 文件级计划\n"
             ))
-            stack.enter_context(patch.object(graph, "planned_paths", return_value={"app/main.py"}))
-            stack.enter_context(patch.object(graph, "prepare_workspace", return_value=(
-                "data/workspaces/fake/attempt-0", {"app/main.py": "x=1\n"},
-            )))
-            stack.enter_context(patch.object(graph, "generate_code_patch", return_value=CodePatchDraft(
+            for module in (graph, candidate_delivery):
+                stack.enter_context(patch.object(module, "planned_paths", return_value={"app/main.py"}))
+                stack.enter_context(patch.object(module, "prepare_workspace", return_value=(
+                    "data/workspaces/fake/attempt-0", {"app/main.py": "x=1\n"},
+                )))
+            stack.enter_context(patch.object(candidate_delivery, "generate_code_patch", return_value=CodePatchDraft(
                 edits=[{"path": "app/main.py", "content": "x=2\n"}], summary="改接口", risks=[],
             )))
-            stack.enter_context(patch.object(graph, "apply_edits", return_value=(
+            stack.enter_context(patch.object(candidate_delivery, "apply_edits", return_value=(
                 "data/workspaces/fake/attempt-0", "--- a/app/main.py\n+++ b/app/main.py\n",
                 [{"path": "app/main.py", "before_sha256": "b" * 64, "after_sha256": "c" * 64}],
             )))
-            stack.enter_context(patch.object(graph, "verify_workspace"))
+            stack.enter_context(patch.object(artifact_store, "verify_workspace"))
 
             client = TestClient(api.app)
             created = client.post("/tasks", json={

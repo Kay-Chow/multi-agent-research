@@ -10,9 +10,9 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from app.config import DB_PATH, task_config
-from app.graph import build_graph
-from app.repo_tools import RepoAccessError, checked_root
-from app.state import RepoContext, initial_state
+from app.tools.repository import RepoAccessError, checked_root
+from app.workflow.graph import build_graph
+from app.workflow.state import RepoContext, initial_state
 
 
 # 当前仍是可信本机的单进程演示；串行访问同一个 SQLite 文件。

@@ -14,13 +14,41 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from app import graph as agent_graph
-from app.agents import (
-    CodePatchDraft, IntakeDecision, IntakeDecisionError, ModeDecision, SupervisorDecision,
-)
-from app.discovery_tools import DiscoveryResult
-from app.repo_tools import RepoAccessError
-from app.state import initial_chat_state, initial_state
+from app.services import artifact_store, candidate_delivery
+from app.workflow import graph as agent_graph
+from app.agents.coder import CodePatchDraft
+from app.agents.intake import IntakeDecision, IntakeDecisionError, ModeDecision
+from app.agents.researcher import ResearchCompleted, ResearchNeedsInput
+from app.workflow.state import initial_chat_state, initial_state
+from app.agents.supervisor import SupervisorDecision
+from app.tools.discovery import DiscoveryResult
+from app.tools.repository import RepoAccessError
+
+
+class ResearchNodeBoundaryTests(unittest.TestCase):
+    """Researcher 节点只映射调研结果，不在图层做检索或业务判断。"""
+
+    def test_missing_evidence_becomes_user_interrupt_step(self):
+        state = initial_state("设计反馈筛选")
+        outcome = ResearchNeedsInput(sources=[], question="请补充内部优先级规则")
+        with patch.object(agent_graph, "conduct_research", return_value=outcome) as research:
+            update = agent_graph.researcher_node(state)
+        research.assert_called_once_with(state)
+        self.assertEqual(update["next_step"], "await_research_input")
+        self.assertEqual(update["research_question"], outcome.question)
+        self.assertEqual(update["conversation"][-1], {"role": "assistant", "text": outcome.question})
+
+    def test_completed_research_becomes_plan_step(self):
+        state = initial_state("设计反馈筛选")
+        outcome = ResearchCompleted(
+            sources=[], research="证据不足", report="# 调研报告\n", event_detail="没有可用来源",
+        )
+        with patch.object(agent_graph, "conduct_research", return_value=outcome) as research:
+            update = agent_graph.researcher_node(state)
+        research.assert_called_once_with(state)
+        self.assertEqual(update["next_step"], "assess_research")
+        self.assertEqual(update["research"], outcome.research)
+        self.assertEqual(update["research_report"], outcome.report)
 
 
 class GraphTests(unittest.TestCase):
@@ -106,25 +134,27 @@ class GraphTests(unittest.TestCase):
         plan_patch.start()
         self.addCleanup(plan_patch.stop)
 
-        # 阶段 3 图测试只验证路由与门禁：隔离工作区和文件校验函数也被替换。
-        # 因此本文件不能证明路径/哈希校验正确；这些在 test_workspace_tools 中测。
-        workspace_patch = patch.object(
-            agent_graph, "prepare_workspace",
-            return_value=("data/workspaces/fake/attempt-0", {"app/main.py": "app = 1\n"}),
-        )
-        workspace_patch.start()
-        self.addCleanup(workspace_patch.stop)
-        paths_patch = patch.object(agent_graph, "planned_paths", return_value={"app/main.py"})
-        paths_patch.start()
-        self.addCleanup(paths_patch.stop)
-        code_patch = patch.object(agent_graph, "generate_code_patch", return_value=CodePatchDraft(
+        # 阶段 3 图测试只验证路由与门禁：工作区和哈希核验函数被替换。
+        # 路径/哈希细节另由 test_workspace_tools 和 test_artifact_store 验证。
+        for module in (agent_graph, candidate_delivery):
+            # workspace_prepare 节点和候选生成服务各自从基线准备工作区。
+            workspace_patch = patch.object(
+                module, "prepare_workspace",
+                return_value=("data/workspaces/fake/attempt-0", {"app/main.py": "app = 1\n"}),
+            )
+            workspace_patch.start()
+            self.addCleanup(workspace_patch.stop)
+            paths_patch = patch.object(module, "planned_paths", return_value={"app/main.py"})
+            paths_patch.start()
+            self.addCleanup(paths_patch.stop)
+        code_patch = patch.object(candidate_delivery, "generate_code_patch", return_value=CodePatchDraft(
             edits=[{"path": "app/main.py", "content": "app = 2\n"}],
             summary="修改演示接口", risks=[],
         ))
         code_patch.start()
         self.addCleanup(code_patch.stop)
         apply_patch = patch.object(
-            agent_graph, "apply_edits",
+            candidate_delivery, "apply_edits",
             return_value=(
                 "data/workspaces/fake/attempt-0",
                 "--- a/app/main.py\n+++ b/app/main.py\n@@ -1 +1 @@\n-app = 1\n+app = 2\n",
@@ -134,7 +164,7 @@ class GraphTests(unittest.TestCase):
         )
         apply_patch.start()
         self.addCleanup(apply_patch.stop)
-        verify_workspace_patch = patch.object(agent_graph, "verify_workspace")
+        verify_workspace_patch = patch.object(artifact_store, "verify_workspace")
         self.verify_workspace_mock = verify_workspace_patch.start()
         self.addCleanup(verify_workspace_patch.stop)
 
@@ -269,6 +299,23 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(intake.call_count, 3)
         supervisor.assert_not_called()
 
+    def test_discovery_failure_returns_to_intake_without_claiming_success(self):
+        """可选知识库查询失败后保留会话，并在事件中如实标记失败。"""
+
+        state = initial_chat_state("查一下需求背景")
+        state["intake_status"] = "lookup"
+        state["discovery_tool"] = "search_kb"
+        state["discovery_query"] = "需求背景"
+        with patch.object(
+            agent_graph, "run_discovery_tool",
+            side_effect=agent_graph.KnowledgeBaseError("连接失败"),
+        ):
+            update = agent_graph.discovery_tool_node(state)
+        self.assertEqual(update["next_step"], "intake")
+        self.assertEqual(update["sources"], [])
+        self.assertIn("连接失败", update["discovery_observations"][0])
+        self.assertIn("失败", update["events"][0])
+
     def test_code_request_without_repo_asks_before_research(self):
         """聊天中的代码任务若未选仓库，不应先生成方案再在代码阶段失败。"""
 
@@ -284,6 +331,28 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(snapshot.next, ("await_user",))
         self.assertIn("仓库路径", snapshot.values["intake_reply"])
         self.assertEqual(snapshot.values["research"], None)
+
+    def test_chat_code_request_after_plan_approval_reaches_diff_review(self):
+        """“先看方案，批准后改代码”仍是同一项代码任务，不在方案保存后结束。"""
+
+        original = "请修改演示项目代码；先看方案，批准后在隔离工作区生成代码和 diff。"
+        state = initial_chat_state(original)
+        state["repo_root"] = "C:/demo"
+        with patch.object(agent_graph, "intake_requirement", return_value=IntakeDecision(
+            ready=True, request="实现反馈列表优先级筛选并补充测试",
+        )), patch.object(agent_graph, "decide_mode", return_value=ModeDecision(
+            mode="code_change", reason="批准后仍要生成候选代码",
+        )) as classify:
+            graph = agent_graph.build_graph(InMemorySaver())
+            graph.invoke(state, config=self.config(state))
+        classify.assert_called_once_with(original)
+        self.assertEqual(graph.get_state(self.config(state)).next, ("review",))
+        self.assertEqual(graph.get_state(self.config(state)).values["mode"], "code_change")
+
+        graph.invoke(Command(resume={"action": "approve"}), config=self.config(state))
+        snapshot = graph.get_state(self.config(state))
+        self.assertEqual(snapshot.next, ("diff_review",))
+        self.assertEqual(snapshot.values["code_review_status"], "pending")
 
     def test_intake_ready_without_reply_gets_default_message(self):
         """模型已整理好需求但省略提示语时，不应因空 reply 重试或停住。"""

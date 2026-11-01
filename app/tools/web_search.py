@@ -1,7 +1,6 @@
 """联网搜索工具：只返回有真实 URL 的、长度受限的搜索结果。"""
 
 import os
-from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -12,8 +11,10 @@ from tavily.errors import (
     TimeoutError as TavilyTimeoutError, UsageLimitExceededError,
 )
 
+from app.config import PROJECT_ROOT
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class WebSearchError(RuntimeError):
